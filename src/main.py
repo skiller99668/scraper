@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, ValidationError
 from typing import Optional
 
+start_time = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+start_sec = time.perf_counter()
+
 class Book(BaseModel):
     title: str
     product_url: str
@@ -30,6 +33,8 @@ page_url = start_url
 
 pages = 0
 detail_pages = 0
+failed_pages = 0
+cache_hits = 0
 seen_urls = set()
 
 books = []
@@ -50,52 +55,145 @@ while page_url and pages < 3:
         try:
             response = requests.get(page_url, headers=headers, timeout=5)
 
-            # print(response.status_code)
+            # success
             if response.status_code == 200:
                 Path("cache").mkdir(exist_ok=True)
-                # print(response.text)
 
                 html = response.text
                 cache_file.write_text(html, encoding="utf-8")
+
+            # 5xx error try again
+            elif 500<=response.status_code <= 600:
+                try:
+                    response = requests.get(page_url, headers=headers, timeout=5)
+
+                    if response.status_code == 200:
+                        Path("cache").mkdir(exist_ok=True)
+
+                        html = response.text
+                        cache_file.write_text(html, encoding="utf-8")
+                    else:
+                        print(f"failed to fetch. error code: {response.status_code}")
+                        failed_pages += 1
+                        continue
+
+                except requests.exceptions.Timeout:
+                    print("Timeout (5.0 s)")
+                    failed_pages += 1
+                    continue
+
+            # fail
             else:
                 print(f"failed to fetch. error code: {response.status_code}")
+                failed_pages += 1
+                continue
 
+        # timeout error try again
         except requests.exceptions.Timeout:
-            print("Timeout (5.0 s)")
+            try:
+                response = requests.get(page_url, headers=headers, timeout=5)
+
+                if response.status_code == 200:
+                    Path("cache").mkdir(exist_ok=True)
+
+                    html = response.text
+                    cache_file.write_text(html, encoding="utf-8")
+                else:
+                    print(f"failed to fetch. error code: {response.status_code}")
+                    failed_pages += 1
+                    continue
+                    
+            except requests.exceptions.Timeout:
+                print("Timeout (5.0 s)")
+                failed_pages += 1
+                continue
 
     soup = BeautifulSoup(html, "html.parser")
 
+    # for every book on page (soup is for this page only)
     for book in soup.find_all("article"):
         link = book.find("a")
-        # print(link.get("href"))
         full_url = urljoin(page_url, link.get("href"))
+        # TEMP: prove error handling works, remove before final run
+        # if full_url.endswith("a-light-in-the-attic_1000/index.html"):
+        #    full_url = "https://books.toscrape.com/catalogue/this-book-totally-does-not-exist_00000/index.html"
         urls.append(full_url)
 
+# =========================================================================================================
         # Extract Records:
+
+        # get html of books first
         path = urlparse(full_url).path
         filename = Path(path).parent.name
 
         book_html_cache = Path(f"cache/books/{filename}")
 
+        # if already cached, just read from it
         if book_html_cache.exists():
             book_html = book_html_cache.read_text(encoding="utf-8")
+            cache_hits += 1
 
+        # if not make the folder GET from site and write onto folder/files (each individual book)
         else:
             time.sleep(0.5)
 
             try:
                 response = requests.get(full_url, headers=headers, timeout=5)
 
+                # successful connection
                 if response.status_code == 200:
                     Path("cache/books").mkdir(parents=True, exist_ok=True)
 
                     book_html = response.text
                     book_html_cache.write_text(book_html, encoding="utf-8")
+
+                # try once more if server 5xx error
+                elif 500<=response.status_code<=600:
+                    try:
+                        response = requests.get(full_url, headers=headers, timeout=5)
+        
+                        # successful connection
+                        if response.status_code == 200:
+                            Path("cache/books").mkdir(parents=True, exist_ok=True)
+        
+                            book_html = response.text
+                            book_html_cache.write_text(book_html, encoding="utf-8")
+                        else:
+                            print(f"failed to fetch. error code: {response.status_code}")
+                            failed_pages += 1
+                            continue
+
+                    except requests.exceptions.Timeout:
+                        print("Timeout (5.0 s)")
+                        failed_pages += 1
+                        continue
+
+                # fail
                 else:
                     print(f"failed to fetch. error code: {response.status_code}")
+                    failed_pages += 1
+                    continue
 
+            # try once more if timeout
             except requests.exceptions.Timeout:
-                            print("Timeout (5.0 s)")
+                try:
+                    response = requests.get(full_url, headers=headers, timeout=5)
+    
+                    # successful connection
+                    if response.status_code == 200:
+                        Path("cache/books").mkdir(parents=True, exist_ok=True)
+    
+                        book_html = response.text
+                        book_html_cache.write_text(book_html, encoding="utf-8")
+                    else:
+                        print(f"failed to fetch. error code: {response.status_code}")
+                        failed_pages += 1
+                        continue
+
+                except requests.exceptions.Timeout:
+                    print("Timeout (5.0 s)")
+                    failed_pages += 1
+                    continue
             
         book_soup = BeautifulSoup(book_html, "html.parser")
 
@@ -125,6 +223,9 @@ while page_url and pages < 3:
                 "source_page": page_url,
                 "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                 }
+        # TEMP: prove validation-error handling works, remove before final run
+        #if full_url.endswith("tipping-the-velvet_999/index.html"):
+        #    book_data["price_gbp"] = "not-a-price"
 
         try:
             book = Book(**book_data)
@@ -132,9 +233,10 @@ while page_url and pages < 3:
             
 
         except ValidationError:
-            errors.append(errors)
+            errors.append(book_data)
 
         detail_pages += 1
+# =========================================================================================================
 
     # see if next page
     next_page = soup.find("li", class_="next")
@@ -147,10 +249,9 @@ while page_url and pages < 3:
     pages+=1
 
 # Add books from all pages to output:
-
 if book_cache_file.exists() == False:
      Path("cache/output").mkdir(exist_ok=True)
-if book_cache_file_error.exists == False:
+if book_cache_file_error.exists() == False:
      Path("cache/output").mkdir(exist_ok=True)
 
 with open(book_cache_file, "w", encoding="utf-8") as f:
@@ -160,8 +261,28 @@ with open(book_cache_file_error, "w", encoding="utf-8") as f:
     json.dump(errors, f, indent=4)
 
 
+# print some stats
 print("catalogue_pages =", pages)
 print("discovered =", len(urls))
 print("unique_urls =", len(seen_urls))
 print(books[0])
 print("detailed_pages=", detail_pages)
+
+# report:
+reportPath = Path("cache/output/run-report.json")
+
+duration = str(round((time.perf_counter() - start_sec), 3)) + "s"
+
+reportData = {
+    "start time": start_time,
+    "duration": duration,
+    "pages fetched": pages,
+    "cache hits": cache_hits,
+    "valid records": len(books),
+    "invalid records": len(errors),
+    "failed pages": failed_pages
+}
+
+with open(reportPath, "w", encoding="utf-8") as f:
+    json.dump(reportData, f, indent=4)
+ 
